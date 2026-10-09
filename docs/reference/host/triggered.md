@@ -23,3 +23,9 @@ Pre-armed copy-engine transfers released by kernels. See
 .. autoclass:: iris.triggered.TriggeredView
    :members: initialize, publish, arrived, wait, reusable, can_publish, can_consume
 ```
+
+## TriggeredView (Gluon device)
+```{eval-rst}
+.. autoclass:: iris.gluon.TriggeredView
+   :members: initialize, publish, arrived, wait, reusable, can_publish, can_consume
+```

@@ -47,6 +47,23 @@ for step in range(steps):
 plan.destroy()
 ```
 
+### Gluon
+
+Gluon kernels use `iris.gluon.TriggeredView`. It reads the same view tensor and has the same
+methods as the Triton `TriggeredView`, so the host side does not change:
+
+```python
+from iris.gluon import TriggeredView
+
+@gluon.jit
+def producer(out, view, ...):
+    ...                                            # write this program's part of the batch
+    TriggeredView.initialize(view).publish(batch)
+```
+
+`publish` waits for vector-memory stores, including AMD buffer stores (`buffer_store`). Call it
+after `gl.warp_specialize` returns, not inside a partition.
+
 ## The kernel author's contract
 
 1. **Batches complete in schedule order.** All of a rank's chains to one peer share one queue and

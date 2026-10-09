@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 # Triggered plans on the copy engines. Each rank owns a slice of a symmetric buffer and sends it to
-# every peer; batches are released by kernels with TriggeredView.publish.
+# every peer; batches are released by kernels with TriggeredView.publish (Triton or Gluon).
 #
 # Every test that arms a plan aborts it on failure, so no chain is left parked on a queue.
 
@@ -13,8 +13,11 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 import iris
+from iris.gluon import TriggeredView as GluonView
 from iris.mem.triton import triggered as dv
 from iris.mem.utils import read_realtime
 from iris.triggered import Batch, Segment, State, TriggeredPlan, TriggeredView, chunks, waves, whole
@@ -236,6 +239,81 @@ def test_many_contributors_one_gate():
                 BLOCK=1024,
             )
             plan.end_device_epoch()
+            _check_and_wipe(ctx, buffer, epoch, slice_elems)
+    ctx.barrier()
+    del ctx
+
+
+@gluon.jit
+def _gluon_producer(buf, view, first, epoch, start, part, CONTRIBUTORS: gl.constexpr, BLOCK: gl.constexpr):
+    """Program p writes part p of the slice and publishes batch p // CONTRIBUTORS."""
+    layout: gl.constexpr = gl.BlockedLayout([BLOCK // (64 * gl.num_warps())], [64], [gl.num_warps()], [0])
+    pid = gl.program_id(0)
+    for off in range(0, part, BLOCK):
+        idx = start + pid * part + off + gl.arange(0, BLOCK, layout=layout)
+        gl.store(buf + idx, (epoch << 24) | idx)
+    GluonView.initialize(view).publish(first + pid // CONTRIBUTORS)
+
+
+@gluon.jit
+def _gluon_consumer(buf, out, status, view, batch_elems, budget, BLOCK: gl.constexpr):
+    """Program q waits for global batch q (up to ``budget`` polls), then copies it from ``buf`` to ``out``."""
+    layout: gl.constexpr = gl.BlockedLayout([BLOCK // (64 * gl.num_warps())], [64], [gl.num_warps()], [0])
+    tv = GluonView.initialize(view)
+    batch = gl.program_id(0)
+    # Every wave must poll the same number of times: arrived() is a CTA-wide operation
+    i = 0
+    ok = tv.arrived(batch)
+    while (ok == 0) & (i < budget):
+        ok = tv.arrived(batch)
+        i += 1
+    if ok:
+        for off in range(0, batch_elems, BLOCK):
+            idx = batch * batch_elems + off + gl.arange(0, BLOCK, layout=layout)
+            gl.store(out + idx, gl.load(buf + idx))
+    gl.store(status + batch, ok.to(gl.int32))
+
+
+def test_gluon_producer_and_consumer():
+    """A Gluon kernel publishes this rank's batches; another waits for every batch and reads it."""
+    ctx = _ctx()
+    rank, world = ctx.get_rank(), ctx.get_num_ranks()
+    slice_elems, num_batches, k, block = 16 * 1024, 4, 2, 1024
+    buffer = ctx.zeros(world * slice_elems, dtype=torch.int32)
+    buffer.fill_(EMPTY)
+    schedules = [
+        chunks(buffer[r * slice_elems : (r + 1) * slice_elems], num_batches, base=buffer, contributors=k)
+        for r in range(world)
+    ]
+    out = torch.empty_like(buffer)
+    status = torch.zeros(world * num_batches, dtype=torch.int32, device=buffer.device)
+
+    with _armed(TriggeredPlan(ctx, buffer, schedules, timeout=20)) as plan:
+        assert [plan.batch_id(r, 0) for r in range(world)] == [r * num_batches for r in range(world)]
+        for epoch in range(1, 4):
+            if epoch > 1:
+                plan.next_epoch()
+            out.fill_(EMPTY)
+            status.zero_()
+            view = plan.begin_device_epoch()
+            _check_before_release(ctx, plan, buffer, slice_elems)
+            _gluon_producer[(num_batches * k,)](
+                buffer,
+                view,
+                plan.batch_id(rank, 0),
+                epoch,
+                rank * slice_elems,
+                slice_elems // (num_batches * k),
+                CONTRIBUTORS=k,
+                BLOCK=block,
+                num_warps=4,
+            )
+            _gluon_consumer[(world * num_batches,)](
+                buffer, out, status, view, slice_elems // num_batches, 20_000_000, BLOCK=block, num_warps=4
+            )
+            plan.end_device_epoch()
+            assert status.tolist() == [1] * (world * num_batches)
+            assert torch.equal(out, _expected(epoch, out.numel()))
             _check_and_wipe(ctx, buffer, epoch, slice_elems)
     ctx.barrier()
     del ctx
